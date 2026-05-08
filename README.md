@@ -18,15 +18,16 @@
 
 ## 界面预览
 
-![主界面](docs/images/main-empty.png)
+<img width="1120" height="820" alt="main-empty" src="https://github.com/user-attachments/assets/682fadf4-9185-44af-bcc0-d365c6f84c6d" />
+
 
 数据文件加载后可以预览解析结果，并把查询条件映射到对应列。
 
-![数据预览与列映射](docs/images/data-preview.png)
+<img width="1120" height="820" alt="data-preview" src="https://github.com/user-attachments/assets/b175e935-49b0-4d07-a830-52a1916a2ce6" />
 
 导出可选择 CSV 或 XLSX。选择 XLSX 时会提示速度开销。
 
-![XLSX 导出](docs/images/xlsx-export.png)
+<img width="1120" height="820" alt="xlsx-export" src="https://github.com/user-attachments/assets/9646a13c-6348-4055-a5fc-26a71a81b283" />
 
 ## 解决的问题
 
