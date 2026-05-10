@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -53,9 +54,11 @@ from .models import QueryField, QueryInfo
 from .utils import now_text
 
 
-class MainWindow(QMainWindow):
-    def __init__(self):
+class BatchPage(QWidget):
+    def __init__(self, mode: str = "query"):
         super().__init__()
+        self.mode = mode
+        self.mode_name = "锁定" if mode == "lock" else "查询"
         self.paths = PATHS
         self.events: queue.Queue = queue.Queue()
         self.queries: list[QueryInfo] = []
@@ -70,11 +73,9 @@ class MainWindow(QMainWindow):
         self.suppress_combo_signal = False
         self.query_details: dict[str, tuple[QueryInfo, list[QueryField], str]] = {}
         self.output_dir_manually_set = False
-        self.log_file = self.paths.logs / f"app_{datetime.now().strftime('%Y%m%d')}.log"
+        self.log_file = self.paths.logs / f"{self.mode}_{datetime.now().strftime('%Y%m%d')}.log"
         self.settings_stacked: bool | None = None
 
-        self.setWindowTitle("YiChaFen-Fucker - 跨平台 GUI 查询工具")
-        self._set_initial_size()
         self._build_ui()
         self._wire_signals()
         self._apply_style()
@@ -97,10 +98,32 @@ class MainWindow(QMainWindow):
         self.resize(width, height)
 
     def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
         self.page = QWidget()
         root = QVBoxLayout(self.page)
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(10)
+
+        mode_banner = QFrame()
+        mode_banner.setObjectName("lockModeBanner" if self.mode == "lock" else "queryModeBanner")
+        mode_layout = QHBoxLayout(mode_banner)
+        mode_layout.setContentsMargins(12, 9, 12, 9)
+        mode_title = QLabel(f"当前页面：{self.mode_name}")
+        mode_title.setObjectName("modeTitle")
+        mode_desc_text = (
+            "查询成功后提交结果页锁定接口，只保存基础查询字段和锁定状态。"
+            if self.mode == "lock"
+            else "查询成功后解析结果页 HTML，并逐条实时保存完整结果。"
+        )
+        mode_desc = QLabel(mode_desc_text)
+        mode_desc.setObjectName("subtleLabel")
+        mode_desc.setWordWrap(True)
+        mode_layout.addWidget(mode_title)
+        mode_layout.addWidget(mode_desc, 1)
+        root.addWidget(mode_banner)
 
         link_group = QGroupBox("1. 链接解析")
         link_layout = QGridLayout(link_group)
@@ -204,9 +227,10 @@ class MainWindow(QMainWindow):
         thread_layout = QGridLayout(self.thread_group)
         self.multithread_check = QCheckBox("启用多线程")
         self.thread_spin = QSpinBox()
-        self.thread_spin.setRange(1, 32)
+        self.thread_spin.setRange(1, 2_147_483_647)
         self.thread_spin.setValue(DEFAULT_THREAD_COUNT)
         self.thread_spin.setEnabled(False)
+        self.thread_spin.setToolTip("不设置软件上限，实际可用数量取决于系统资源和目标站点承受能力。")
         self.thread_tip = QLabel("默认单线程")
         self.thread_tip.setObjectName("subtleLabel")
         thread_layout.addWidget(self.multithread_check, 0, 0)
@@ -272,7 +296,7 @@ class MainWindow(QMainWindow):
 
         controls = QHBoxLayout()
         controls.addStretch(1)
-        self.start_button = QPushButton("开始查询")
+        self.start_button = QPushButton(f"开始{self.mode_name}")
         self.pause_button = QPushButton("暂停")
         self.pause_button.setEnabled(False)
         self.stop_button = QPushButton("停止")
@@ -287,7 +311,7 @@ class MainWindow(QMainWindow):
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
         self.scroll_area.setWidget(self.page)
-        self.setCentralWidget(self.scroll_area)
+        outer.addWidget(self.scroll_area)
 
     def _arrange_settings(self, *, stacked: bool) -> None:
         if self.settings_stacked == stacked:
@@ -436,6 +460,21 @@ class MainWindow(QMainWindow):
                 color: #667085;
                 padding: 7px 4px;
             }
+            QFrame#queryModeBanner {
+                background: #eef6ff;
+                border: 1px solid #b9d7ff;
+                border-radius: 6px;
+            }
+            QFrame#lockModeBanner {
+                background: #fff6e7;
+                border: 1px solid #f4c979;
+                border-radius: 6px;
+            }
+            QLabel#modeTitle {
+                color: #172033;
+                font-weight: 700;
+                min-width: 96px;
+            }
             """
         )
 
@@ -479,6 +518,8 @@ class MainWindow(QMainWindow):
     def _default_output_path(self, query_name: str | None = None) -> Path:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         title = self._safe_filename(query_name or "未选择查询")
+        if self.mode == "lock":
+            return self._output_directory() / f"{timestamp}_锁定_{title}{self._selected_output_ext()}"
         return self._output_directory() / f"{timestamp}_{title}{self._selected_output_ext()}"
 
     def _selected_output_ext(self) -> str:
@@ -684,7 +725,7 @@ class MainWindow(QMainWindow):
     def clear_cache(self) -> None:
         removed = CacheCleaner.clean(self.paths)
         self._append_log(f"缓存清理完成：删除 {removed} 个文件或目录")
-        QMessageBox.information(self, "清理完成", f"已清理 cookies、验证码图片和临时缓存，共 {removed} 项。")
+        QMessageBox.information(self, "清理完成", f"已清理 cookies、验证码图片、临时缓存和工具缓存，共 {removed} 项。")
 
     def _on_multithread_toggled(self, checked: bool) -> None:
         self.thread_spin.setEnabled(checked)
@@ -842,9 +883,9 @@ class MainWindow(QMainWindow):
         rows, skipped_duplicates = self._deduplicate_rows(self.dataframe.to_dict(orient="records"), mappings)
         if skipped_duplicates:
             self._append_log(f"已跳过 {skipped_duplicates} 条重复查询条件")
-        self._append_log(f"本次输出文件：{output_path}")
+        self._append_log(f"本次{self.mode_name}输出文件：{output_path}")
         self.progress_bar.setValue(0)
-        self.count_label.setText(f"已查询 0 / {len(rows)}")
+        self.count_label.setText(f"已处理 0 / {len(rows)}")
         self.time_label.setText("已用 00:00:00")
         self.eta_label.setText("预计剩余 --:--:--")
         self.speed_label.setText("速度 0.00 条/秒")
@@ -864,6 +905,7 @@ class MainWindow(QMainWindow):
             refresh_class=self.refresh_class_edit.text(),
             multithread=self.multithread_check.isChecked(),
             thread_count=self.thread_spin.value(),
+            task_mode=self.mode,
         )
         self.current_run_id = self.runner.run_id
         self.start_button.setEnabled(False)
@@ -1018,7 +1060,7 @@ class MainWindow(QMainWindow):
         eta = float(event.get("eta", 0.0))
         percent = int(done * 100 / total) if total else 0
         self.progress_bar.setValue(percent)
-        self.count_label.setText(f"已查询 {done} / {total}，成功 {event.get('success', 0)}，失败 {event.get('failed', 0)}")
+        self.count_label.setText(f"已处理 {done} / {total}，成功 {event.get('success', 0)}，失败 {event.get('failed', 0)}")
         self.time_label.setText(f"已用 {self._format_seconds(elapsed)}")
         eta_text = self._format_seconds(eta) if speed > 0 and done < total else "00:00:00"
         self.eta_label.setText(f"预计剩余 {eta_text}")
@@ -1036,16 +1078,22 @@ class MainWindow(QMainWindow):
         self.runner = None
         self.current_run_id = ""
         self._update_start_state()
-        title = "查询已停止" if stopped else "查询完成"
+        title = f"{self.mode_name}已停止" if stopped else f"{self.mode_name}完成"
         self._append_log(f"{title}，输出文件：{output}")
         failure_log = self._save_failure_report(output, failures)
+        cleaned = 0
+        if not stopped:
+            cleaned = CacheCleaner.clean(self.paths)
+            self._append_log(f"任务正常完成，已自动清理缓存：删除 {cleaned} 个文件或目录")
+        cache_text = f"\n自动清理缓存：{cleaned} 项" if not stopped else ""
         QMessageBox.information(
             self,
             title,
             "成功 "
             f"{event.get('success', 0)} 条，失败 {event.get('failed', 0)} 条\n"
             f"结果文件：{output}\n"
-            f"失败日志：{failure_log}",
+            f"失败日志：{failure_log}"
+            f"{cache_text}",
         )
 
     def _save_failure_report(self, output: str, failures: list[dict[str, str]]) -> Path:
@@ -1085,3 +1133,62 @@ class MainWindow(QMainWindow):
         minutes = (seconds % 3600) // 60
         secs = seconds % 60
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("YiChaFen-Fucker - 跨平台 GUI 查询工具")
+        self._set_initial_size()
+
+        self.tabs = QTabWidget()
+        self.query_page = BatchPage("query")
+        self.lock_page = BatchPage("lock")
+        self.tabs.addTab(self.query_page, "查询")
+        self.tabs.addTab(self.lock_page, "锁定")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.setCentralWidget(self.tabs)
+        self._apply_shell_style()
+        self.statusBar().showMessage("当前页面：查询", 3000)
+
+    def _set_initial_size(self) -> None:
+        self.setMinimumSize(720, 560)
+        screen = QApplication.primaryScreen()
+        if not screen:
+            self.resize(1040, 780)
+            return
+
+        rect = screen.availableGeometry()
+        width = min(1180, max(720, rect.width() - 120))
+        height = min(900, max(560, rect.height() - 120))
+        self.resize(width, height)
+
+    def _apply_shell_style(self) -> None:
+        self.setStyleSheet(
+            """
+            QMainWindow {
+                background: #f5f7fb;
+            }
+            QTabWidget::pane {
+                border: 0;
+                background: #f5f7fb;
+            }
+            QTabBar::tab {
+                padding: 9px 22px;
+                margin: 0 2px;
+                border: 1px solid #cbd5e1;
+                border-bottom: 0;
+                background: #edf2f7;
+                color: #344054;
+                font-weight: 600;
+            }
+            QTabBar::tab:selected {
+                background: #ffffff;
+                color: #172033;
+            }
+            """
+        )
+
+    def _on_tab_changed(self, index: int) -> None:
+        name = self.tabs.tabText(index)
+        self.statusBar().showMessage(f"已切换到{name}页面", 3000)

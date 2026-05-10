@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Local environments
+.venv/
+venv/
+
+# Local test data
+data.xlsx
+
+# Runtime folders
+cache/
+logs/*
+!logs/.gitkeep
+output/*
+!output/.gitkeep

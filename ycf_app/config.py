@@ -12,6 +12,7 @@ CACHE_ROOT = APP_ROOT / "cache"
 os.environ.setdefault("XDG_CACHE_HOME", str(CACHE_ROOT))
 os.environ.setdefault("MPLCONFIGDIR", str(CACHE_ROOT / "matplotlib"))
 os.environ.setdefault("PIP_CACHE_DIR", str(CACHE_ROOT / "pip"))
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(CACHE_ROOT / "tools" / "playwright"))
 
 DEFAULT_HOME_URL = ""
 DEFAULT_QUERY_URL = ""
@@ -46,6 +47,10 @@ class AppPaths:
         return self.cache / "temp"
 
     @property
+    def tools(self) -> Path:
+        return self.cache / "tools"
+
+    @property
     def cache(self) -> Path:
         return self.root / "cache"
 
@@ -54,7 +59,7 @@ class AppPaths:
         return self.cache / "captcha"
 
     def ensure(self) -> None:
-        for path in [self.logs, self.output, self.cache, self.cookies, self.temp, self.ocr]:
+        for path in [self.logs, self.output, self.cache, self.cookies, self.temp, self.ocr, self.tools]:
             path.mkdir(parents=True, exist_ok=True)
             keep = path / ".gitkeep"
             if not keep.exists():

@@ -28,6 +28,14 @@ from .utils import clean_text
 
 class YichafenParser:
     post_pattern = re.compile(r"\$\.post\(\s*['\"]([^'\"]+)['\"]", re.I)
+    lock_post_pattern = re.compile(
+        r"doLockBtn[\s\S]{0,3000}?\$\.post\(\s*['\"]([^'\"]+)['\"]",
+        re.I,
+    )
+    lock_success_pattern = re.compile(
+        r"doLockBtn[\s\S]{0,3000}?location\.href\s*=\s*['\"]([^'\"]+)['\"]",
+        re.I,
+    )
 
     @classmethod
     def parse_home(cls, page_url: str, html: str) -> list[QueryInfo]:
@@ -141,6 +149,46 @@ class YichafenParser:
             raise ValueError("结果页没有解析到竖排结果表")
         return data
 
+    @classmethod
+    def parse_lock_action(cls, page_url: str, html: str) -> str:
+        post_url, _ = cls.parse_lock_request(page_url, html)
+        return post_url
+
+    @classmethod
+    def parse_lock_request(cls, page_url: str, html: str) -> tuple[str, str]:
+        soup = BeautifulSoup(html, "html.parser")
+        if not soup.select_one("#doLockBtn"):
+            raise ValueError("结果页没有找到锁定按钮")
+
+        lock_script = ""
+        for script in soup.find_all("script"):
+            text = script.get_text("\n")
+            if "doLockBtn" not in text:
+                continue
+            start = text.find("doLockBtn")
+            if start < 0:
+                continue
+            lock_script = text[start:]
+            for marker in ('$("#doSaveEditedFieldsBtn")', "$('#doSaveEditedFieldsBtn')", "function checkData"):
+                marker_index = lock_script.find(marker)
+                if marker_index > 0:
+                    lock_script = lock_script[:marker_index]
+                    break
+            break
+
+        if not lock_script:
+            raise ValueError("结果页没有找到锁定按钮脚本")
+
+        post_match = cls.lock_post_pattern.search(lock_script)
+        if not post_match:
+            raise ValueError("结果页没有锁定提交接口，当前查询可能未开启锁定")
+
+        success_url = ""
+        success_match = cls.lock_success_pattern.search(lock_script)
+        if success_match:
+            success_url = urljoin(page_url, success_match.group(1).strip())
+        return urljoin(page_url, post_match.group(1).strip()), success_url
+
 
 class YichafenClient:
     def __init__(self, paths: AppPaths, cookie_name: str, timeout: int = 20):
@@ -228,6 +276,20 @@ class YichafenClient:
         url = urljoin(self.base_url + "/", result_url)
         response = self._request("GET", url, headers={"Referer": self.query_url})
         return response.text
+
+    def submit_lock(self, lock_url: str, referer: str) -> dict[str, Any]:
+        headers = {
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": self.origin,
+            "Referer": referer,
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        response = self._request("POST", lock_url, headers=headers, data={})
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise ValueError(f"锁定接口未返回 JSON：{response.text[:200]}") from exc
 
     def get_captcha_image(self) -> bytes:
         url = urljoin(self.base_url + "/", f"/public/verify.html?random={time.time()}")
@@ -439,7 +501,7 @@ def make_result_writer(path: Path) -> ResultCsvWriter | ResultXlsxWriter:
 class CacheCleaner:
     @staticmethod
     def clean(paths: AppPaths, *, include_logs: bool = False) -> int:
-        targets = [paths.cookies, paths.ocr, paths.temp]
+        targets = [paths.cookies, paths.ocr, paths.temp, paths.tools]
         if include_logs:
             targets.append(paths.logs)
 
@@ -475,6 +537,7 @@ class QueryRunner:
         refresh_class: str,
         multithread: bool,
         thread_count: int,
+        task_mode: str = "query",
     ):
         self.paths = paths
         self.events = events
@@ -490,6 +553,8 @@ class QueryRunner:
         self.refresh_class = refresh_class.strip() or DEFAULT_REFRESH_CLASS
         self.multithread = multithread
         self.thread_count = max(1, thread_count if multithread else 1)
+        self.task_mode = task_mode
+        self.task_name = "锁定" if task_mode == "lock" else "查询"
         self.stop_event = threading.Event()
         self.pause_event = threading.Event()
         self.done = 0
@@ -534,7 +599,7 @@ class QueryRunner:
     def _run(self) -> None:
         self.started_at = time.monotonic()
         self.log(
-            f"开始查询：{self.query_info.name}，总计 {len(self.rows)} 条，"
+            f"开始{self.task_name}：{self.query_info.name}，总计 {len(self.rows)} 条，"
             f"线程数 {self.thread_count}，验证码策略 {self.strategy}"
         )
         self._emit_progress()
@@ -564,7 +629,7 @@ class QueryRunner:
         finally:
             status = "已停止" if self.stop_event.is_set() else "已完成"
             self.log(
-                f"{status}：成功 {self.success} 条，失败 {self.failed} 条，"
+                f"{self.task_name}{status}：成功 {self.success} 条，失败 {self.failed} 条，"
                 f"输出文件 {self.output_path}"
             )
             self.emit(
@@ -594,6 +659,14 @@ class QueryRunner:
                 self.log(f"线程 {ident} 已初始化会话 Cookie")
             return self.clients[ident]
 
+    def _get_lock_context(self, index: int) -> dict[str, Any]:
+        ident = threading.get_ident()
+        cookie_name = f"lock_{self.run_id}_{index}_{ident}_{int(time.time() * 1000)}"
+        client = YichafenClient(self.paths, cookie_name)
+        client.open_query_page(self.query_info.url)
+        self.log(f"[{index}] 已初始化独立锁定会话")
+        return {"client": client, "since_refresh": 0}
+
     def _process_row(self, index: int, row: dict[str, str]) -> None:
         self._wait_if_paused()
         if self.stop_event.is_set():
@@ -604,24 +677,34 @@ class QueryRunner:
         self._wait_if_paused()
         if self.stop_event.is_set():
             return
-        context = self._get_context()
+        context = self._get_lock_context(index) if self.task_mode == "lock" else self._get_context()
         client: YichafenClient = context["client"]
 
         try:
             attempt = self._query_with_strategy(client, params, allow_ocr=self.strategy in {"ocr", "mixed"})
-            if attempt.success and attempt.data:
+            for retry_index in range(1, 3):
+                if not self._needs_fresh_lock_session(attempt.message):
+                    break
+                self.log(f"[{index}] 当前会话已锁定过其他查询，正在更换独立会话重试 {retry_index}/2")
+                context = self._get_lock_context(index)
+                client = context["client"]
+                attempt = self._query_with_strategy(client, params, allow_ocr=self.strategy in {"ocr", "mixed"})
+            if attempt.data and (attempt.success or self.task_mode == "lock"):
                 self.writer.append(attempt.data)
+            if attempt.success:
                 self._mark_done(success=True)
                 ocr_suffix = "，OCR" if attempt.used_ocr else ""
                 self.log(f"[{index}] 成功{ocr_suffix}：{label}")
             else:
+                if self.task_mode == "lock" and not attempt.data:
+                    self.writer.append(self._build_lock_output(params, success=False))
                 self._mark_done(success=False, index=index, data=label, reason=attempt.message)
                 self.log(f"[{index}] 失败：{label}；{attempt.message}")
         except Exception as exc:
             self._mark_done(success=False, index=index, data=label, reason=str(exc))
             self.log(f"[{index}] 异常：{label}；{exc}")
 
-        if self.strategy in {"refresh", "mixed"} and not self.stop_event.is_set():
+        if self.task_mode != "lock" and self.strategy in {"refresh", "mixed"} and not self.stop_event.is_set():
             self._wait_if_paused()
             if self.stop_event.is_set():
                 return
@@ -654,6 +737,19 @@ class QueryRunner:
             parts.append(f"{field.label}={params.get(field.name, '')}")
         return "，".join(parts)
 
+    def _build_lock_output(self, params: dict[str, str], *, success: bool) -> dict[str, str]:
+        data = {field.label: params.get(field.name, "") for field in self.fields}
+        data["锁定是否成功"] = "是" if success else "否"
+        return data
+
+    @staticmethod
+    def _is_already_locked_message(message: str) -> bool:
+        return "查询已锁定" in message or "已被锁定" in message
+
+    @staticmethod
+    def _needs_fresh_lock_session(message: str) -> bool:
+        return "已经锁定过一个查询" in message or "不要锁定别人" in message
+
     def _query_with_strategy(
         self,
         client: YichafenClient,
@@ -676,22 +772,67 @@ class QueryRunner:
         allow_ocr: bool,
     ) -> QueryAttempt:
         if int(response.get("status", 0)) == 1:
-            result_url = response.get("url", "")
-            if not result_url:
-                return QueryAttempt(False, "提交成功但未返回结果页 URL")
-            self._wait_if_paused()
-            if self.stop_event.is_set():
-                return QueryAttempt(False, "用户停止")
-            html = client.get_result_page(result_url)
-            data = YichafenParser.parse_result(html)
-            return QueryAttempt(True, response.get("info", "查询成功"), data=data)
+            return self._handle_successful_submit(client, params, response)
 
         info = clean_text(response.get("info", "查询失败"))
+        if self.task_mode == "lock" and self._is_already_locked_message(info):
+            return QueryAttempt(True, info, data=self._build_lock_output(params, success=True))
         captcha_required = bool(response.get("showPicVerify")) or "验证码" in info
         if captcha_required and allow_ocr:
             self.log(f"检测到验证码，进入 OCR 重试：{info}")
             return self._retry_with_ocr(client, params)
         return QueryAttempt(False, info, captcha_required=captcha_required)
+
+    def _handle_successful_submit(
+        self,
+        client: YichafenClient,
+        params: dict[str, str],
+        response: dict[str, Any],
+        *,
+        used_ocr: bool = False,
+    ) -> QueryAttempt:
+        result_url = response.get("url", "")
+        if not result_url:
+            return QueryAttempt(False, "提交成功但未返回结果页 URL")
+        self._wait_if_paused()
+        if self.stop_event.is_set():
+            return QueryAttempt(False, "用户停止")
+
+        html = client.get_result_page(result_url)
+        if self.task_mode == "lock":
+            result_page_url = urljoin(client.base_url + "/", result_url)
+            try:
+                lock_url, success_url = YichafenParser.parse_lock_request(result_page_url, html)
+                self._wait_if_paused()
+                if self.stop_event.is_set():
+                    return QueryAttempt(False, "用户停止")
+                lock_result = client.submit_lock(lock_url, referer=result_page_url)
+                success = int(lock_result.get("status", 0)) == 1
+                info = clean_text(lock_result.get("info", ""))
+                if success and success_url:
+                    message = f"锁定成功：{success_url}"
+                elif success:
+                    message = "锁定成功"
+                else:
+                    message = info or "锁定接口返回失败"
+                if not success and self._is_already_locked_message(message):
+                    success = True
+                return QueryAttempt(
+                    success,
+                    message,
+                    data=self._build_lock_output(params, success=success),
+                    used_ocr=used_ocr,
+                )
+            except Exception as exc:
+                return QueryAttempt(
+                    False,
+                    f"锁定失败：{exc}",
+                    data=self._build_lock_output(params, success=False),
+                    used_ocr=used_ocr,
+                )
+
+        data = YichafenParser.parse_result(html)
+        return QueryAttempt(True, response.get("info", "查询成功"), data=data, used_ocr=used_ocr)
 
     def _retry_with_ocr(self, client: YichafenClient, params: dict[str, str]) -> QueryAttempt:
         last_message = "验证码识别失败"
@@ -718,18 +859,7 @@ class QueryRunner:
                 return QueryAttempt(False, "用户停止")
             response = client.submit_conditions(self.post_url, retry_params)
             if int(response.get("status", 0)) == 1:
-                result_url = response.get("url", "")
-                self._wait_if_paused()
-                if self.stop_event.is_set():
-                    return QueryAttempt(False, "用户停止")
-                html = client.get_result_page(result_url)
-                data = YichafenParser.parse_result(html)
-                return QueryAttempt(
-                    True,
-                    response.get("info", "查询成功"),
-                    data=data,
-                    used_ocr=True,
-                )
+                return self._handle_successful_submit(client, params, response, used_ocr=True)
 
             last_message = clean_text(response.get("info", "验证码重试失败"))
             captcha_required = bool(response.get("showPicVerify")) or "验证码" in last_message
